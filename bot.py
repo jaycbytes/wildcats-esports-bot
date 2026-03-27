@@ -18,8 +18,6 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_REPO = os.getenv("GITHUB_REPO", "jaycbytes/wildcats-esports")
 EVENTS_JSON_PATH = os.getenv("EVENTS_JSON_PATH", "public/data/events.json")
 IMAGES_PATH = os.getenv("IMAGES_PATH", "public/images/events")
-ALLOWED_ROLE = os.getenv("ALLOWED_ROLE", "Officer")
-
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -44,11 +42,6 @@ def format_date(date_str: str) -> str:
     dt = datetime.strptime(date_str, "%Y-%m-%d")
     return f"{dt.strftime('%B')} {dt.day}, {dt.year}"
 
-
-def is_officer(interaction: discord.Interaction) -> bool:
-    if interaction.guild is None:
-        return False
-    return discord.utils.get(interaction.user.roles, name=ALLOWED_ROLE) is not None
 
 
 def get_events_file():
@@ -111,10 +104,7 @@ async def on_ready():
 async def on_app_command_error(
     interaction: discord.Interaction, error: app_commands.AppCommandError
 ):
-    if isinstance(error, app_commands.CheckFailure):
-        msg = f"You need the **{ALLOWED_ROLE}** role to use this command."
-    else:
-        msg = f"Something went wrong: `{error}`"
+    msg = f"Something went wrong: `{error}`"
 
     if interaction.response.is_done():
         await interaction.followup.send(msg, ephemeral=True)
@@ -127,6 +117,7 @@ async def on_app_command_error(
 # ---------------------------------------------------------------------------
 
 @bot.tree.command(name="add-event", description="Add a new event to the Wildcats Esports website")
+@app_commands.default_permissions(administrator=True)
 @app_commands.describe(
     title="Event title",
     date="Date in YYYY-MM-DD format  (e.g. 2026-04-15)",
@@ -144,7 +135,6 @@ async def on_app_command_error(
     app_commands.Choice(name="Past", value="past"),
     app_commands.Choice(name="Upcoming", value="upcoming"),
 ])
-@app_commands.check(is_officer)
 async def add_event(
     interaction: discord.Interaction,
     title: str,
@@ -270,6 +260,7 @@ async def add_event(
 # ---------------------------------------------------------------------------
 
 @bot.tree.command(name="add-images", description="Add images to an existing event's gallery")
+@app_commands.default_permissions(administrator=True)
 @app_commands.describe(
     event_id="The event to add images to (start typing to search)",
     image1="Gallery image to add",
@@ -278,7 +269,6 @@ async def add_event(
     image4="Gallery image to add",
     image5="Gallery image to add",
 )
-@app_commands.check(is_officer)
 async def add_images(
     interaction: discord.Interaction,
     event_id: str,
@@ -395,8 +385,8 @@ async def add_images_autocomplete(
 # ---------------------------------------------------------------------------
 
 @bot.tree.command(name="remove-event", description="Remove an event from the Wildcats Esports website")
+@app_commands.default_permissions(administrator=True)
 @app_commands.describe(event_id="The event ID to remove (start typing to search)")
-@app_commands.check(is_officer)
 async def remove_event(interaction: discord.Interaction, event_id: str):
     await interaction.response.defer(ephemeral=True)
 
