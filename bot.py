@@ -68,6 +68,35 @@ def save_events_file(data: dict, sha: str, commit_msg: str):
     )
 
 
+async def upload_image(session: aiohttp.ClientSession, attachment: discord.Attachment, label: str) -> str:
+    """Download attachment and upload to GitHub. Returns relative web path."""
+    async with session.get(attachment.url) as resp:
+        if resp.status != 200:
+            raise RuntimeError(f"Could not download image `{attachment.filename}` from Discord.")
+        img_bytes = await resp.read()
+
+    github_path = f"{IMAGES_PATH}/{attachment.filename}"
+    try:
+        try:
+            existing = repo.get_contents(github_path)
+            repo.update_file(
+                path=github_path,
+                message=f"feat: upload image for '{label}' via Discord bot",
+                content=img_bytes,
+                sha=existing.sha,
+            )
+        except GithubException:
+            repo.create_file(
+                path=github_path,
+                message=f"feat: upload image for '{label}' via Discord bot",
+                content=img_bytes,
+            )
+    except GithubException as e:
+        raise RuntimeError(f"Failed to upload `{attachment.filename}` to GitHub: `{e}`")
+
+    return f"/images/events/{attachment.filename}"
+
+
 # ---------------------------------------------------------------------------
 # Bot events
 # ---------------------------------------------------------------------------
@@ -104,7 +133,11 @@ async def on_app_command_error(
     location="Where the event takes place",
     description="Short description of the event",
     status="Past or upcoming?",
-    image="Optional JPG/PNG image to upload for the event card",
+    image1="Primary event image (used as the card thumbnail)",
+    image2="Additional gallery image",
+    image3="Additional gallery image",
+    image4="Additional gallery image",
+    image5="Additional gallery image",
     gallery_id="Optional gallery slug (auto-generated from title if omitted)",
 )
 @app_commands.choices(status=[
@@ -119,7 +152,11 @@ async def add_event(
     location: str,
     description: str,
     status: app_commands.Choice[str],
-    image: discord.Attachment = None,
+    image1: discord.Attachment = None,
+    image2: discord.Attachment = None,
+    image3: discord.Attachment = None,
+    image4: discord.Attachment = None,
+    image5: discord.Attachment = None,
     gallery_id: str = None,
 ):
     await interaction.response.defer(ephemeral=True)
@@ -133,12 +170,14 @@ async def add_event(
         )
         return
 
-    # Validate attachment is an image
-    if image and not image.content_type.startswith("image/"):
-        await interaction.followup.send(
-            "Attachment must be an image (JPG or PNG).", ephemeral=True
-        )
-        return
+    # Collect and validate all provided images
+    raw_images = [img for img in [image1, image2, image3, image4, image5] if img is not None]
+    for img in raw_images:
+        if not img.content_type.startswith("image/"):
+            await interaction.followup.send(
+                f"`{img.filename}` is not an image (JPG or PNG required).", ephemeral=True
+            )
+            return
 
     event_id = slugify(title)
     status_val = status.value
@@ -162,45 +201,20 @@ async def add_event(
         )
         return
 
-    # Upload image to GitHub repo if one was attached
-    image_path = None
-    if image:
-        github_image_path = f"{IMAGES_PATH}/{image.filename}"
-
+    # Upload all images
+    gallery_paths = []
+    if raw_images:
         async with aiohttp.ClientSession() as session:
-            async with session.get(image.url) as resp:
-                if resp.status != 200:
-                    await interaction.followup.send(
-                        "Could not download the image from Discord. Try again.", ephemeral=True
-                    )
+            for img in raw_images:
+                try:
+                    path = await upload_image(session, img, title)
+                    gallery_paths.append(path)
+                except RuntimeError as e:
+                    await interaction.followup.send(str(e), ephemeral=True)
                     return
-                img_bytes = await resp.read()
-
-        try:
-            try:
-                existing = repo.get_contents(github_image_path)
-                repo.update_file(
-                    path=github_image_path,
-                    message=f"feat: upload image for '{title}' via Discord bot",
-                    content=img_bytes,
-                    sha=existing.sha,
-                )
-            except GithubException:
-                repo.create_file(
-                    path=github_image_path,
-                    message=f"feat: upload image for '{title}' via Discord bot",
-                    content=img_bytes,
-                )
-        except GithubException as e:
-            await interaction.followup.send(
-                f"Failed to upload image to GitHub: `{e}`", ephemeral=True
-            )
-            return
-
-        image_path = f"/images/events/{image.filename}"
 
     # Resolve gallery_id
-    resolved_gallery_id = gallery_id or (event_id if image_path else None)
+    resolved_gallery_id = gallery_id or (event_id if gallery_paths else None)
 
     # Build the new event object
     new_event = {
@@ -214,9 +228,10 @@ async def add_event(
         "badgeClass": "badge-past" if status_val == "past" else "badge-upcoming",
         "badgeText": "Past Event" if status_val == "past" else "Upcoming",
         "dateColor": "text-energy-yellow" if status_val == "past" else "text-baby-blue",
-        "image": image_path or "/images/events/placeholder.jpg",
+        "image": gallery_paths[0] if gallery_paths else "/images/events/placeholder.jpg",
         "imageAlt": title,
         "galleryId": resolved_gallery_id,
+        "gallery": gallery_paths,
     }
 
     data["events"].append(new_event)
@@ -238,12 +253,141 @@ async def add_event(
     embed.add_field(name="Location", value=location, inline=True)
     embed.add_field(name="Status", value=status_val.capitalize(), inline=True)
     embed.add_field(name="Event ID", value=f"`{event_id}`", inline=False)
-    if image_path:
-        embed.add_field(name="Image", value=f"`{image_path}`", inline=False)
+    if gallery_paths:
+        embed.add_field(
+            name=f"Images ({len(gallery_paths)})",
+            value="\n".join(f"`{p}`" for p in gallery_paths),
+            inline=False,
+        )
     else:
-        embed.set_footer(text="No image attached — using placeholder. Upload one manually later.")
+        embed.set_footer(text="No images attached — using placeholder. Use /add-images to add photos later.")
 
     await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# ---------------------------------------------------------------------------
+# /add-images
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(name="add-images", description="Add images to an existing event's gallery")
+@app_commands.describe(
+    event_id="The event to add images to (start typing to search)",
+    image1="Gallery image to add",
+    image2="Gallery image to add",
+    image3="Gallery image to add",
+    image4="Gallery image to add",
+    image5="Gallery image to add",
+)
+@app_commands.check(is_officer)
+async def add_images(
+    interaction: discord.Interaction,
+    event_id: str,
+    image1: discord.Attachment = None,
+    image2: discord.Attachment = None,
+    image3: discord.Attachment = None,
+    image4: discord.Attachment = None,
+    image5: discord.Attachment = None,
+):
+    await interaction.response.defer(ephemeral=True)
+
+    # Collect and validate provided images
+    raw_images = [img for img in [image1, image2, image3, image4, image5] if img is not None]
+    if not raw_images:
+        await interaction.followup.send("Please attach at least one image.", ephemeral=True)
+        return
+
+    for img in raw_images:
+        if not img.content_type.startswith("image/"):
+            await interaction.followup.send(
+                f"`{img.filename}` is not an image (JPG or PNG required).", ephemeral=True
+            )
+            return
+
+    # Read events.json
+    try:
+        data, sha = get_events_file()
+    except GithubException as e:
+        await interaction.followup.send(
+            f"Failed to read `events.json` from GitHub: `{e}`", ephemeral=True
+        )
+        return
+
+    events = data.get("events", [])
+    target = next((e for e in events if e["id"] == event_id), None)
+
+    if target is None:
+        valid = ", ".join(f"`{e['id']}`" for e in events)
+        await interaction.followup.send(
+            f"No event found with id `{event_id}`.\nValid IDs: {valid or 'none'}",
+            ephemeral=True,
+        )
+        return
+
+    # Upload images
+    new_paths = []
+    async with aiohttp.ClientSession() as session:
+        for img in raw_images:
+            try:
+                path = await upload_image(session, img, target["title"])
+                new_paths.append(path)
+            except RuntimeError as e:
+                await interaction.followup.send(str(e), ephemeral=True)
+                return
+
+    # Append to gallery array (create it if missing for older events)
+    if "gallery" not in target:
+        target["gallery"] = []
+    target["gallery"].extend(new_paths)
+
+    # Set galleryId if it was null (event now has images)
+    if not target.get("galleryId"):
+        target["galleryId"] = target["id"]
+
+    try:
+        save_events_file(data, sha, f"feat: add {len(new_paths)} image(s) to '{event_id}' via Discord bot")
+    except GithubException as e:
+        await interaction.followup.send(
+            f"Failed to write `events.json` to GitHub: `{e}`", ephemeral=True
+        )
+        return
+
+    embed = discord.Embed(
+        title="Images Added",
+        description=f"Added **{len(new_paths)}** image(s) to **{target['title']}**.",
+        color=0x82D6FF,
+    )
+    embed.add_field(
+        name="New Images",
+        value="\n".join(f"`{p}`" for p in new_paths),
+        inline=False,
+    )
+    embed.add_field(
+        name="Total Gallery Images",
+        value=str(len(target["gallery"])),
+        inline=True,
+    )
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@add_images.autocomplete("event_id")
+async def add_images_autocomplete(
+    interaction: discord.Interaction, current: str
+):
+    try:
+        data, _ = get_events_file()
+        events = data.get("events", [])
+    except Exception:
+        return []
+
+    matches = [
+        e for e in events
+        if current.lower() in e["id"].lower() or current.lower() in e["title"].lower()
+    ]
+    return [
+        app_commands.Choice(name=f"{e['id']} — {e['title']}", value=e["id"])
+        for e in matches
+    ][:25]
 
 
 # ---------------------------------------------------------------------------
