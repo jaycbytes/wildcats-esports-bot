@@ -451,6 +451,266 @@ async def remove_event_autocomplete(
 
 
 # ---------------------------------------------------------------------------
+# /list-events
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(name="list-events", description="List all events on the Wildcats Esports website")
+@app_commands.default_permissions(administrator=True)
+async def list_events(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        data, _ = get_events_file()
+    except GithubException as e:
+        await interaction.followup.send(
+            f"Failed to read `events.json` from GitHub: `{e}`", ephemeral=True
+        )
+        return
+
+    events = data.get("events", [])
+    if not events:
+        await interaction.followup.send("No events found.", ephemeral=True)
+        return
+
+    sorted_events = sorted(events, key=lambda e: e.get("date", ""), reverse=True)
+    upcoming = [e for e in sorted_events if e.get("status") == "upcoming"]
+    past = [e for e in sorted_events if e.get("status") == "past"]
+
+    embed = discord.Embed(
+        title="Wildcats Esports Events",
+        description=f"**{len(events)}** total event(s)",
+        color=0x82D6FF,
+    )
+
+    if upcoming:
+        lines = [
+            f"`{e['id']}` — {e['title']} ({e.get('dateDisplay', e.get('date'))})"
+            for e in upcoming
+        ]
+        embed.add_field(name=f"Upcoming ({len(upcoming)})", value="\n".join(lines), inline=False)
+
+    if past:
+        lines = [
+            f"`{e['id']}` — {e['title']} ({e.get('dateDisplay', e.get('date'))})"
+            for e in past
+        ]
+        embed.add_field(name=f"Past ({len(past)})", value="\n".join(lines), inline=False)
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# ---------------------------------------------------------------------------
+# /update-event-status
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(name="update-event-status", description="Change an event's status between upcoming and past")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(
+    event_id="The event to update (start typing to search)",
+    status="New status for the event",
+)
+@app_commands.choices(status=[
+    app_commands.Choice(name="Past", value="past"),
+    app_commands.Choice(name="Upcoming", value="upcoming"),
+])
+async def update_event_status(
+    interaction: discord.Interaction,
+    event_id: str,
+    status: app_commands.Choice[str],
+):
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        data, sha = get_events_file()
+    except GithubException as e:
+        await interaction.followup.send(
+            f"Failed to read `events.json` from GitHub: `{e}`", ephemeral=True
+        )
+        return
+
+    events = data.get("events", [])
+    target = next((e for e in events if e["id"] == event_id), None)
+
+    if target is None:
+        valid = ", ".join(f"`{e['id']}`" for e in events)
+        await interaction.followup.send(
+            f"No event found with id `{event_id}`.\nValid IDs: {valid or 'none'}",
+            ephemeral=True,
+        )
+        return
+
+    old_status = target.get("status", "unknown")
+    new_status = status.value
+
+    if old_status == new_status:
+        await interaction.followup.send(
+            f"**{target['title']}** is already marked as `{new_status}`. No changes made.",
+            ephemeral=True,
+        )
+        return
+
+    target["status"] = new_status
+    target["badgeClass"] = "badge-past" if new_status == "past" else "badge-upcoming"
+    target["badgeText"] = "Past Event" if new_status == "past" else "Upcoming"
+    target["dateColor"] = "text-energy-yellow" if new_status == "past" else "text-baby-blue"
+
+    try:
+        save_events_file(data, sha, f"feat: update event '{event_id}' status to '{new_status}' via Discord bot")
+    except GithubException as e:
+        await interaction.followup.send(
+            f"Failed to write `events.json` to GitHub: `{e}`", ephemeral=True
+        )
+        return
+
+    embed = discord.Embed(
+        title="Event Status Updated",
+        description=f"**{target['title']}** status changed.",
+        color=0x82D6FF if new_status == "upcoming" else 0xF7D760,
+    )
+    embed.add_field(name="Event ID", value=f"`{event_id}`", inline=True)
+    embed.add_field(name="Old Status", value=old_status.capitalize(), inline=True)
+    embed.add_field(name="New Status", value=new_status.capitalize(), inline=True)
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@update_event_status.autocomplete("event_id")
+async def update_status_autocomplete(
+    interaction: discord.Interaction, current: str
+):
+    try:
+        data, _ = get_events_file()
+        events = data.get("events", [])
+    except Exception:
+        return []
+
+    matches = [
+        e for e in events
+        if current.lower() in e["id"].lower() or current.lower() in e["title"].lower()
+    ]
+    return [
+        app_commands.Choice(name=f"{e['id']} — {e['title']} [{e.get('status', '?')}]", value=e["id"])
+        for e in matches
+    ][:25]
+
+
+# ---------------------------------------------------------------------------
+# /edit-event
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(name="edit-event", description="Edit the details of an existing event")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(
+    event_id="The event to edit (start typing to search)",
+    title="New title (leave blank to keep current)",
+    date="New date in YYYY-MM-DD format (leave blank to keep current)",
+    location="New location (leave blank to keep current)",
+    description="New description (leave blank to keep current)",
+)
+async def edit_event(
+    interaction: discord.Interaction,
+    event_id: str,
+    title: str = None,
+    date: str = None,
+    location: str = None,
+    description: str = None,
+):
+    await interaction.response.defer(ephemeral=True)
+
+    if not any([title, date, location, description]):
+        await interaction.followup.send(
+            "Please provide at least one field to update.", ephemeral=True
+        )
+        return
+
+    if date:
+        try:
+            datetime.strptime(date, "%Y-%m-%d")
+        except ValueError:
+            await interaction.followup.send(
+                "Invalid date. Use `YYYY-MM-DD` format, e.g. `2026-04-15`.", ephemeral=True
+            )
+            return
+
+    try:
+        data, sha = get_events_file()
+    except GithubException as e:
+        await interaction.followup.send(
+            f"Failed to read `events.json` from GitHub: `{e}`", ephemeral=True
+        )
+        return
+
+    events = data.get("events", [])
+    target = next((e for e in events if e["id"] == event_id), None)
+
+    if target is None:
+        valid = ", ".join(f"`{e['id']}`" for e in events)
+        await interaction.followup.send(
+            f"No event found with id `{event_id}`.\nValid IDs: {valid or 'none'}",
+            ephemeral=True,
+        )
+        return
+
+    changes = []
+
+    if title:
+        target["title"] = title
+        target["imageAlt"] = title
+        changes.append(f"**Title** → `{title}`")
+
+    if date:
+        target["date"] = date
+        target["dateDisplay"] = format_date(date)
+        changes.append(f"**Date** → `{target['dateDisplay']}`")
+
+    if location:
+        target["location"] = location
+        changes.append(f"**Location** → `{location}`")
+
+    if description:
+        target["description"] = description
+        changes.append("**Description** updated")
+
+    try:
+        save_events_file(data, sha, f"feat: edit event '{event_id}' via Discord bot")
+    except GithubException as e:
+        await interaction.followup.send(
+            f"Failed to write `events.json` to GitHub: `{e}`", ephemeral=True
+        )
+        return
+
+    embed = discord.Embed(
+        title="Event Updated",
+        description=f"**{target['title']}** has been updated.",
+        color=0x82D6FF,
+    )
+    embed.add_field(name="Event ID", value=f"`{event_id}`", inline=False)
+    embed.add_field(name="Changes", value="\n".join(changes), inline=False)
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@edit_event.autocomplete("event_id")
+async def edit_event_autocomplete(
+    interaction: discord.Interaction, current: str
+):
+    try:
+        data, _ = get_events_file()
+        events = data.get("events", [])
+    except Exception:
+        return []
+
+    matches = [
+        e for e in events
+        if current.lower() in e["id"].lower() or current.lower() in e["title"].lower()
+    ]
+    return [
+        app_commands.Choice(name=f"{e['id']} — {e['title']}", value=e["id"])
+        for e in matches
+    ][:25]
+
+
+# ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 
